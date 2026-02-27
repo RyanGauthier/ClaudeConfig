@@ -78,7 +78,16 @@ npm install -g happy-coder
 Add to `~/.zshrc` or `~/.zprofile`:
 
 ```bash
-export PATH="$HOME/.npm-global/bin:/opt/homebrew/opt/node@20/bin:$HOME/.bun/bin:$HOME/bin:$PATH"
+# ~/bin MUST come before .npm-global/bin so gemini-guard.sh intercepts all `gemini` calls
+export PATH="$HOME/bin:$HOME/.npm-global/bin:/opt/homebrew/opt/node@20/bin:$HOME/.bun/bin:$PATH"
+```
+
+### Gemini Guard Symlink
+
+```bash
+# Intercept all `gemini` calls through the sandbox guard
+mkdir -p ~/bin
+ln -sf ~/claude-tools/gemini-guard.sh ~/bin/gemini
 ```
 
 ### npm Global Directory
@@ -290,6 +299,16 @@ File: `~/.claude/settings.local.json`
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/memory-retrieval.sh",
+            "timeout": 5000
+          }
+        ]
+      },
       {
         "matcher": "Write|Edit",
         "hooks": [
@@ -934,7 +953,159 @@ esac
 exit 0
 ```
 
-### 8g. guard-code-session.sh — Stop Hook Guard
+### 8g. memory-retrieval.sh — Reflexive Memory Retrieval
+
+PostToolUse hook on `Read`. Automatically queries the FTS5 memory index whenever Claude reads a source file, injecting relevant memories as a `systemMessage`. Turns the memory system from passive (must search manually) to active (surfaces knowledge at the point of action).
+
+**Design:**
+- **Query method**: `sqlite3` CLI directly (~85ms vs ~1500ms Node.js engine startup)
+- **Trigger**: `Read` only (not Edit — Edit fires too frequently; Read is the decision point)
+- **Debounce**: Per-directory, 120s TTL (covers typical exploration burst)
+- **Keywords**: Extracted from path segments, camelCase-split, noise words filtered
+- **Results**: Top 5 chunks by BM25 relevance
+- **Failure mode**: All errors → silent `{}` (never blocks Claude's workflow)
+
+```bash
+#!/usr/bin/env bash
+# PostToolUse hook: reflexive memory retrieval on Read
+# Queries FTS5 index with keywords extracted from file path
+# Returns systemMessage with top 5 relevant memory chunks
+
+set -euo pipefail
+
+DB="$HOME/claude-memory/global/memory.db"
+DEBOUNCE_TTL=120
+
+# Read JSON from stdin
+INPUT=$(cat)
+
+# Extract file_path from tool_input
+FILE_PATH=$(echo "$INPUT" | /usr/bin/python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('tool_input', {}).get('file_path', ''))
+except:
+    print('')
+" 2>/dev/null)
+
+[ -z "$FILE_PATH" ] && echo '{}' && exit 0
+
+# Guard: only source files
+EXT="${FILE_PATH##*.}"
+case "$EXT" in
+    ts|tsx|js|jsx|prisma|sql|md|json|yaml|yml|sh|py|go|rs) ;;
+    *) echo '{}' && exit 0 ;;
+esac
+
+# Guard: DB must exist
+[ ! -f "$DB" ] && echo '{}' && exit 0
+
+# Guard: sqlite3 must exist
+command -v sqlite3 &>/dev/null || { echo '{}'; exit 0; }
+
+# Debounce: per-directory, 120s TTL
+DIR=$(dirname "$FILE_PATH")
+HASH=$(echo -n "$DIR" | md5 -q 2>/dev/null || echo -n "$DIR" | md5sum 2>/dev/null | cut -d' ' -f1)
+MARKER="/tmp/.claude-mem-${HASH}"
+
+if [ -f "$MARKER" ]; then
+    AGE=$(( $(date +%s) - $(stat -f %m "$MARKER" 2>/dev/null || stat -c %Y "$MARKER" 2>/dev/null || echo 0) ))
+    if [ "$AGE" -lt "$DEBOUNCE_TTL" ]; then
+        echo '{}'
+        exit 0
+    fi
+fi
+touch "$MARKER"
+
+# Extract keywords from path segments
+NOISE="src|app|lib|utils|index|route|routes|components|pages|api|hooks|types|common|shared|core|node_modules|dist|build"
+
+BASENAME=$(basename "$FILE_PATH" ".$EXT")
+DIRPATH=$(dirname "$FILE_PATH")
+
+SEGMENTS=""
+COUNT=0
+IFS='/' read -ra PARTS <<< "$DIRPATH"
+for ((i=${#PARTS[@]}-1; i>=0 && COUNT < 3; i--)); do
+    SEG="${PARTS[$i]}"
+    [ -z "$SEG" ] && continue
+    if ! echo "$SEG" | grep -qEi "^($NOISE)$"; then
+        SEGMENTS="$SEG $SEGMENTS"
+        COUNT=$((COUNT + 1))
+    fi
+done
+
+SEGMENTS="$BASENAME $SEGMENTS"
+
+# Split camelCase, deduplicate, build FTS5 MATCH query
+KEYWORDS=$(echo "$SEGMENTS" | /usr/bin/python3 -c "
+import sys, re
+text = sys.stdin.read().strip()
+words = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+words = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', words)
+tokens = re.split(r'[-_.\s]+', words.lower())
+seen = set()
+result = []
+for t in tokens:
+    if len(t) >= 3 and t not in seen:
+        seen.add(t)
+        result.append(t)
+print(' OR '.join(result[:6]))
+" 2>/dev/null)
+
+[ -z "$KEYWORDS" ] && echo '{}' && exit 0
+
+# Escape single quotes for SQL
+SQL_KEYWORDS="${KEYWORDS//\'/\'\'}"
+
+# Query FTS5 as JSON, format with Python for safe output
+sqlite3 -json "$DB" "
+SELECT mc.heading, substr(mc.content, 1, 200) AS content, mc.source_file
+FROM memory_fts
+JOIN memory_chunks mc ON mc.id = memory_fts.rowid
+WHERE memory_fts MATCH '${SQL_KEYWORDS}'
+ORDER BY bm25(memory_fts, 5.0, 1.0, 2.0)
+LIMIT 5;
+" 2>/dev/null | /usr/bin/python3 -c "
+import sys, json, os
+
+home = os.environ.get('HOME', '')
+file_path = '${FILE_PATH}'.replace(home, '~') if home else '${FILE_PATH}'
+
+try:
+    rows = json.load(sys.stdin)
+except:
+    print('{}')
+    sys.exit(0)
+
+if not rows:
+    print('{}')
+    sys.exit(0)
+
+lines = [f'Memory retrieval for {file_path}:']
+for r in rows:
+    heading = r.get('heading', '').replace('\n', ' ').strip()
+    content = r.get('content', '').replace('\n', ' ').strip()[:150]
+    source = r.get('source_file', '').replace(home, '~') if home else r.get('source_file', '')
+    source = source.lstrip('.').lstrip('/')
+    lines.append(f'  [{heading}] {content} ({source})')
+
+print(json.dumps({'systemMessage': chr(10).join(lines)}))
+" 2>/dev/null || echo '{}'
+```
+
+**Testing:**
+```bash
+# Test with a source file path
+echo '{"tool_name":"Read","tool_input":{"file_path":"/path/to/project/packages/db/src/tenant.ts"}}' | bash ~/.claude/hooks/memory-retrieval.sh
+
+# Test debounce (run twice — second returns {})
+# Test non-source file (use .png — returns {})
+# Test missing DB (rename memory.db — returns {})
+```
+
+### 8h. guard-code-session.sh — Stop Hook Guard
 
 Only runs Stop hooks (code review on exit) if in a git repo with changes.
 
@@ -1321,7 +1492,28 @@ For projects with persistent agent memory:
     └── solutions.md
 ```
 
-### 11e. Initial PROFILE.md
+### 11e. Reflexive Memory Retrieval
+
+The memory system includes an active retrieval layer via a `PostToolUse` hook on `Read`. When Claude reads any source file, the hook automatically queries the FTS5 index using keywords extracted from the file path and injects matching memory chunks as a `systemMessage`.
+
+**How it works:**
+1. Hook fires after every `Read` tool call
+2. Extracts keywords from the file path (splits camelCase, filters noise words like `src`/`app`/`lib`)
+3. Queries `memory_fts` via `sqlite3 -json` with BM25 ranking (`bm25(memory_fts, 5.0, 1.0, 2.0)`)
+4. Returns top 5 matching chunks as a system message Claude sees inline
+
+**Guards:**
+- Only triggers on source file extensions (`.ts`, `.tsx`, `.js`, `.jsx`, `.prisma`, `.sql`, `.md`, `.json`, `.yaml`, `.yml`, `.sh`, `.py`, `.go`, `.rs`)
+- Per-directory debounce with 120s TTL prevents re-querying during exploration bursts
+- All failures (missing DB, bad query, sqlite3 not found) → silent `{}`, never blocks workflow
+
+**Performance:** ~85ms per invocation (sqlite3 CLI, no Node.js startup). Well within the 5s timeout.
+
+**Script:** `~/.claude/hooks/memory-retrieval.sh` (see [Section 8g](#8g-memory-retrievalsh--reflexive-memory-retrieval))
+
+**Effect:** Hard-won knowledge (tenant isolation patterns, build error solutions, calibration data) surfaces automatically when reading related files — before mistakes happen.
+
+### 11f. Initial PROFILE.md
 
 Create `~/claude-memory/global/PROFILE.md`:
 
@@ -1392,15 +1584,40 @@ Reference file for Codex CLI and Gemini CLI invocation patterns.
 
 ## Gemini CLI Invocation
 
-### Code review (multi-file)
+**CRITICAL: Always use `gemini-sandbox.sh` wrapper. Gemini CLI `-s` flag does NOT prevent filesystem writes.**
+
+### Code review (multi-file) — SANDBOXED
 ```bash
-(
-  echo "Review this code for bugs, security issues, and edge cases. FINRA compliance context. Cite filenames and line numbers. Only flag real issues, not style."
-  echo ""
-  for f in $(git diff --name-only HEAD~1 HEAD -- '*.ts' '*.tsx'); do
-    echo "=== $f ==="; cat "$f"
-  done
-) | gemini -s -y -p "You are a read-only code reviewer. Analyze the code provided via stdin." > /tmp/gemini-review.md 2>&1
+cd /path/to/repo
+FILES=$(git diff --name-only HEAD~1 HEAD -- '*.ts' '*.tsx' | tr '\n' ' ')
+~/claude-tools/gemini-sandbox.sh \
+  "Review this code for bugs, security issues, and edge cases. FINRA compliance context: check tenant isolation, audit logging, RBAC enforcement, TypeScript strictness. Cite filenames and line numbers. Only flag real issues, not style." \
+  $FILES
+```
+
+### Spec-anchored review — SANDBOXED
+```bash
+cd /path/to/repo
+FILES="path/to/spec.md $(git diff --name-only HEAD~1 HEAD -- '*.ts' '*.tsx' | tr '\n' ' ')"
+~/claude-tools/gemini-sandbox.sh \
+  "Can you review the following code? Look for code items for review. Not just code correctness, but function checking code after compile, with full context. Max effort. Make sure [SPEC_NAME] is followed." \
+  $FILES
+```
+
+### Deep research — SANDBOXED
+```bash
+cd /path/to/repo
+~/claude-tools/gemini-sandbox.sh \
+  "Research: <topic>. Provide findings with sources, tradeoffs, and risks. Focus on what's non-obvious." \
+  relevant-file1.ts relevant-file2.ts
+```
+
+### Debugging assist — SANDBOXED
+```bash
+cd /path/to/repo
+~/claude-tools/gemini-sandbox.sh \
+  "Bug: <description of symptoms>. Analyze this code for root cause. Consider race conditions, off-by-ones, state corruption, and edge cases." \
+  $relevant_files
 ```
 
 ## API Bridge Invocation
@@ -1457,7 +1674,156 @@ PHONE="<YOUR_PHONE_NUMBER>"
 osascript -e "tell application \"Messages\" to send \"[$TYPE] $MESSAGE\" to buddy \"$PHONE\" of (1st account whose service type = iMessage)"
 ```
 
-### 13c. agent-memory-flush.sh
+### 13c. gemini-sandbox.sh — Explicit Gate 3 Wrapper
+
+Creates a disposable read-only git worktree, runs Gemini inside it, captures output. Gemini can READ everything but WRITE nothing.
+
+```bash
+#!/bin/bash
+# gemini-sandbox.sh — Run Gemini CLI in a read-only worktree
+# Usage: gemini-sandbox.sh "review prompt" file1.ts file2.ts ...
+#
+# Creates a disposable git worktree, makes all files read-only,
+# runs Gemini inside it, captures output, and cleans up.
+# Gemini can READ everything but WRITE nothing.
+
+set -euo pipefail
+
+PROMPT="$1"
+shift
+FILES=("$@")
+
+SANDBOX_DIR=$(mktemp -d /tmp/gemini-sandbox-XXXXXX)
+COMMIT=$(git rev-parse HEAD)
+OUTPUT="/tmp/gemini-review.md"
+
+cleanup() {
+  chmod -R u+w "$SANDBOX_DIR" 2>/dev/null || true
+  git worktree remove "$SANDBOX_DIR" --force 2>/dev/null || rm -rf "$SANDBOX_DIR"
+}
+trap cleanup EXIT
+
+echo "Creating read-only sandbox at $SANDBOX_DIR..."
+
+git worktree add "$SANDBOX_DIR" "$COMMIT" --detach --quiet 2>/dev/null
+
+find "$SANDBOX_DIR" -type f -exec chmod a-w {} +
+
+INPUT=""
+for f in "${FILES[@]}"; do
+  if [[ -f "$SANDBOX_DIR/$f" ]]; then
+    INPUT+="--- $f ---"$'\n'
+    INPUT+=$(cat "$SANDBOX_DIR/$f")
+    INPUT+=$'\n\n'
+  elif [[ -f "$f" ]]; then
+    INPUT+="--- $f ---"$'\n'
+    INPUT+=$(cat "$f")
+    INPUT+=$'\n\n'
+  fi
+done
+
+echo "Running Gemini in sandbox ($(echo "${FILES[@]}" | wc -w | tr -d ' ') files)..."
+
+(echo "$PROMPT"; echo "$INPUT") | \
+  /Users/ailabs/.npm-global/bin/gemini -s -y -p "You are reviewing code. Do NOT modify any files. Only output your review findings as text." \
+  > "$OUTPUT" 2>&1
+
+MODIFIED=$(cd "$SANDBOX_DIR" && git diff --name-only 2>/dev/null || true)
+if [[ -n "$MODIFIED" ]]; then
+  echo "WARNING: Gemini attempted to modify files (blocked by read-only permissions):"
+  echo "$MODIFIED"
+  echo "---"
+  echo "All modifications were blocked. Sandbox integrity confirmed."
+else
+  echo "Sandbox integrity confirmed — no file modifications detected."
+fi
+
+echo "Review saved to $OUTPUT"
+```
+
+### 13d. gemini-guard.sh — Drop-in Interceptor for ALL `gemini` Calls
+
+Symlinked at `~/bin/gemini` (PATH override). Intercepts ALL `gemini` invocations — including from Gate 3 templates, finishing plans, and any other scripts. Creates a read-only worktree, translates CWD, runs the real binary, verifies the original repo is untouched, and auto-restores if modified.
+
+```bash
+#!/bin/bash
+# gemini-guard.sh — Drop-in replacement for `gemini` CLI that enforces read-only sandbox
+#
+# Install: ln -sf ~/claude-tools/gemini-guard.sh ~/bin/gemini  (put ~/bin before .npm-global in PATH)
+#
+# This wrapper:
+#   1. Detects if we're inside a git repo
+#   2. If yes: creates a read-only worktree, runs Gemini there, cleans up
+#   3. If no: runs Gemini normally (non-repo contexts are safe)
+#   4. ALWAYS verifies no files were modified in the original repo
+
+set -uo pipefail
+
+REAL_GEMINI="/Users/ailabs/.npm-global/bin/gemini"
+ORIGINAL_DIR="$(pwd)"
+
+if ! command -v "$REAL_GEMINI" &>/dev/null; then
+  echo "ERROR: Gemini CLI not found at $REAL_GEMINI" >&2
+  exit 1
+fi
+
+# If not in a git repo, just pass through (no risk of modifying tracked files)
+if ! git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+  exec "$REAL_GEMINI" "$@"
+fi
+
+# We're in a git repo — sandbox it
+REPO_ROOT=$(git rev-parse --show-toplevel)
+SANDBOX_DIR=$(mktemp -d /tmp/gemini-guard-XXXXXX)
+COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD)
+
+cleanup() {
+  if [[ -d "$SANDBOX_DIR" ]]; then
+    chmod -R u+w "$SANDBOX_DIR" 2>/dev/null || true
+    git -C "$REPO_ROOT" worktree remove "$SANDBOX_DIR" --force 2>/dev/null || rm -rf "$SANDBOX_DIR"
+  fi
+}
+trap cleanup EXIT
+
+# Create detached worktree and make read-only
+git -C "$REPO_ROOT" worktree add "$SANDBOX_DIR" "$COMMIT" --detach --quiet 2>/dev/null
+find "$SANDBOX_DIR" -type f -exec chmod a-w {} +
+
+# Translate the current working directory into the sandbox
+REL_DIR="${ORIGINAL_DIR#$REPO_ROOT}"
+SANDBOX_CWD="$SANDBOX_DIR$REL_DIR"
+if [[ ! -d "$SANDBOX_CWD" ]]; then
+  SANDBOX_CWD="$SANDBOX_DIR"
+fi
+
+# Run Gemini from the sandbox directory with all original arguments
+cd "$SANDBOX_CWD"
+"$REAL_GEMINI" "$@"
+EXIT_CODE=$?
+
+# Verify the ORIGINAL repo wasn't modified (belt-and-suspenders)
+MODIFIED=$(git -C "$REPO_ROOT" diff --name-only 2>/dev/null || true)
+if [[ -n "$MODIFIED" ]]; then
+  echo "" >&2
+  echo "WARNING: Files in original repo were modified during Gemini run:" >&2
+  echo "$MODIFIED" >&2
+  echo "Restoring original state..." >&2
+  git -C "$REPO_ROOT" checkout -- . 2>/dev/null
+  echo "Original repo restored." >&2
+fi
+
+exit $EXIT_CODE
+```
+
+**Installation:**
+```bash
+chmod +x ~/claude-tools/gemini-sandbox.sh ~/claude-tools/gemini-guard.sh
+mkdir -p ~/bin
+ln -sf ~/claude-tools/gemini-guard.sh ~/bin/gemini
+# Ensure ~/bin is first in PATH (see Section 1)
+```
+
+### 13e. agent-memory-flush.sh
 
 Post-agent memory consolidation script (for SubagentStop hooks in project settings).
 
@@ -1605,7 +1971,7 @@ terminal-notifier -message "Test notification" -title "Claude Code"
 ## Notes
 
 - **Secrets**: Store API keys in macOS Keychain (`security add-generic-password`), never in files. The api-bridge.mjs reads from Keychain at runtime.
-- **Gemini sandbox bug**: The `-s` flag does NOT prevent Gemini from writing files. Always diff after Gemini runs or use a read-only git worktree.
+- **Gemini sandbox bug**: The `-s` flag does NOT prevent Gemini from writing files. This is mitigated by a two-tier protection system (established 2026-02-16): (1) `gemini-sandbox.sh` — explicit wrapper for Gate 3 templates that creates a read-only worktree and pipes files; (2) `gemini-guard.sh` — drop-in interceptor symlinked at `~/bin/gemini` that intercepts ALL `gemini` calls, creates a read-only worktree, translates CWD, and auto-restores the original repo if modified. See Sections 1 (PATH + symlink) and 13c/13d (scripts).
 - **macOS-specific**: `stat -f %m` (epoch seconds), `terminal-notifier`, `osascript` for iMessage. Adapt for Linux.
 - **Plugin cache**: Plugins install to `~/.claude/plugins/cache/`. They update automatically.
 - **but.dev hooks**: The `but claude pre-tool` / `post-tool` / `stop` commands are from but.dev. Remove those hook entries if not using but.dev.
