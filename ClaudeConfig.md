@@ -1,7 +1,8 @@
 # Claude Code Full Setup Configuration
 
 > Comprehensive setup document for replicating this Claude Code environment on a fresh machine.
-> Generated 2026-02-14. No secrets, keys, or PII included — placeholders marked with `<REDACTED>`.
+> Generated 2026-02-14. Updated 2026-03-01 (post-99_ protocol review: 4-agent Gate 2 pipeline, AI hygiene anti-pattern checklist, expanded Sonnet delegation).
+> No secrets, keys, or PII included — placeholders marked with `<REDACTED>`.
 
 ---
 
@@ -486,25 +487,31 @@ Always act as a triage controller. Opus is the orchestrator — it plans, review
 - Reading files and returning raw content
 - Simple text transformations with explicit specs
 
-**Delegate to Sonnet** (clear-spec implementation only):
+**Delegate to Sonnet** (implementation + breadth-first analysis):
 - Implementing functions/components from a detailed, unambiguous spec Opus wrote
 - Writing tests when Opus specifies the exact cases
 - Applying mechanical refactors (rename, extract, move) with explicit instructions
 - Generating boilerplate/scaffolding from a template Opus defines
+- Adversarial code review (auth gaps, race conditions, edge cases, logic flaws)
+- Browser automation and QA testing
+- Requirements verification against specs
+- Standards/convention enforcement and dead code detection
+- Post-implementation auditing (comparing build against requirements)
 
-**Keep on Opus** (everything requiring judgment):
+**Keep on Opus** (deep reasoning + judgment):
 - All planning and architecture
 - Writing specs and task decompositions
 - Any task with ambiguous requirements
 - Bug diagnosis and debugging
-- Code review of all delegated work
-- Security-sensitive code
+- Deep cross-layer architectural tracing (multi-hop, 3+ file chains)
+- Security-sensitive code and security review
 - Integration logic and cross-file reasoning
+- Gate 2 triage (classifying findings as VALID/FP)
 - Final approval of all changes
 
-## Context Window Escalation (API with 1M Context)
+## Context Window Escalation (API Bridge)
 
-Default to Max plan (CLI subagents). Escalate to API 1M context only when: task can't be decomposed, 15+ tightly coupled files, decomposition was attempted and failed. API bridge: `~/claude-tools/api-bridge.mjs`. Usage log: `~/claude-tools/usage.log`.
+Opus 4.6 now has native 1M context on Max plan — the primary context window constraint is resolved. The API bridge (`~/claude-tools/api-bridge.mjs`) remains useful for: parallel batch processing, piping large file sets to Sonnet agents, and offline/async review tasks. Escalate to API bridge only when: you need parallel model invocations, or need to pipe >20 files to a single Sonnet agent that won't fit in a subagent's working context. Usage log: `~/claude-tools/usage.log`.
 
 ## Codex CLI — Read-Only Subagent (OpenAI)
 
@@ -543,34 +550,72 @@ After Gate 1 passes, before claiming a feature is complete:
 3. **Test one adversarial path.** Ask: "What would a hostile or careless user do?"
 4. **Only then report complete.**
 
-### Gate 2: Code Review + Security Review (AUTO-ENFORCED)
+### Gate 2: Specialized Review Pipeline (AUTO-ENFORCED)
 
-A PreToolUse hook (`pre-commit-gate.sh`) blocks every `git commit` until both review agents have run. This is automatic — you cannot skip it.
+A PreToolUse hook (`pre-commit-gate.sh`) blocks every `git commit` until review agents have run. This is automatic — you cannot skip it.
+
+Gate 2 uses four specialized review agents run in parallel, followed by an Opus triage step. This structure catches more issues than two generic reviewers — benchmarked at 11 distinct findings vs 6-9 from a single-model pass.
 
 **When the pre-commit gate blocks a commit:**
 
 1. Run `git diff --cached` to identify staged changes
-2. Dispatch **both agents in parallel** via the Task tool:
-   - `code-reviewer` (subagent_type): "Review these staged changes for bugs, code quality, tenant isolation, audit completeness, and RBAC enforcement."
-   - `security-reviewer` (subagent_type): "Review these staged changes for security vulnerabilities — OWASP Top 10, auth/authz gaps, injection, secrets exposure, tenant crosstalk."
-3. Triage findings: classify each as VALID / FALSE POSITIVE
-4. If issues found: fix them directly, re-stage, and re-run both agents
-5. When both agents pass clean: run `touch /tmp/.claude-gate2-approved` then retry the commit
-6. Only escalate to user if a finding is ambiguous or requires an architectural decision
+2. Dispatch **all four review agents in parallel** in a single message with four Task tool calls:
+   - **Architect** — `Task(subagent_type="code-reviewer", model="opus", name="architect-reviewer", prompt="Review these staged changes for architectural correctness, spec alignment, and multi-layer bugs. Trace error handling and data flow across file boundaries. Run `git diff --cached` to see the changes.")`
+   - **Adversarial** — `Task(subagent_type="code-reviewer", model="sonnet", name="adversarial-reviewer", prompt="Act as an adversarial reviewer. Try to break this code — find logic flaws, auth inconsistencies, race conditions, unsafe type casts, edge cases, and mock mismatches in tests. Run `git diff --cached` to see the changes.")`
+   - **Standards** — `Task(subagent_type="code-reviewer", model="sonnet", name="standards-reviewer", prompt="Review for code standards: flag dead code, overly long functions, naming convention violations, and unnecessary complexity. Run `git diff --cached` to see the changes.")`
+   - **Security** — `Task(subagent_type="security-reviewer", model="opus", name="security-reviewer", prompt="Review these staged changes for security vulnerabilities — OWASP Top 10, auth/authz gaps, injection, secrets exposure, tenant crosstalk. Run `git diff --cached` to see the changes.")`
 
-**Override path:** If the user explicitly says "skip review" or the commit is trivial: run `touch /tmp/.claude-gate2-approved` without dispatching agents.
+**Known Anti-Pattern Checklist (agents must flag these):**
+   - **TOCTOU race**: Any `findUnique`/`findFirst` followed by `update`/`delete` on the same model without a `$transaction` or `withTenantTransaction` wrapper
+   - **Key zeroing gap**: Any `decryptDataKey` or `generateDataKey` call where `.fill(0)` is not called on the returned buffer before the function exits
+   - **Missing audit snapshot**: Any `createAuditLog` call on a state mutation that lacks `before` or `after` parameters when the mutation changes existing data
+   - **Object literal cast**: Any `{...} as SomeType` — use type annotations instead
 
-**Marker rules:** One-time-use (deleted after commit passes), expires after 30 minutes.
+**AI Code Hygiene Patterns (from 99_AI_CODE_HYGIENE_STANDARDS.md — agents must also flag these):**
+   - **Tautological tests** (6.10): Tests that always pass regardless of implementation — `expect(true)`, mocks returning hardcoded values with assertions on the same values
+   - **Empty catch / silent failure masking** (4.7, 6.8): `catch (e) {}` or `catch (e) { return { success: true } }` — every catch must handle or re-throw
+   - **`as any` type erasure** (1.3): Zero tolerance in production code — replace with proper types
+   - **Undocumented `as unknown as`** (1.5): Every `as unknown as X` cast requires a `// CAST:` comment explaining why
+   - **Bare `.parse()` in route handlers** (2.15): Must use `.safeParse()` — bare `.parse()` throws unhandled exceptions
+   - **Enum value hallucination** (2.7): AI-invented enum values not in Prisma schema — verify every enum literal against schema definitions
+   - **Floating-point on financial values** (6.12): Use `Decimal.js` or integer cents — IEEE 754 cannot represent `$0.10` exactly
+   - **N+1 queries in list endpoints** (5.10): Prisma queries inside loops — use `include`/`select` or batch queries
+   - **Phantom abstractions** (4.1): Helper functions with exactly one call site — inline the logic
+   - **Missing tenant scoping** (2.16): Any Prisma query without `prismaWithTenant` or explicit `brokerDealerId` filter
+   - **ReDoS-vulnerable regex** (6.15): Nested quantifiers in user-facing regex patterns
+   - **Inconsistent error response format** (5.1): All API errors must return `{ error: string, code: string, details?: unknown }`
+
+3. **Triage step (Opus orchestrator — not delegated):** The orchestrator reads all four agent outputs and performs triage directly. This is judgment work and must not be delegated.
+   - **Deduplicate:** Match findings by file path + line range + issue category. If two agents flag the same location for the same class of issue, merge into one finding and note which agents caught it. Distinct issues at the same location are kept separate.
+   - **Classify each finding:**
+     - **VALID — implementation bug**: auto-fixable, route to implementer
+     - **VALID — spec gap**: escalate to user, requires upstream change
+     - **VALID — architecture miss**: escalate to user, requires design decision
+     - **FALSE POSITIVE**: log in agent calibration memory (feeds into Gate 2.5 write-back below)
+     - **DEFERRED**: acknowledged, not blocking this PR
+   - **Domain risk modifier:** Findings in auth, payments, or data access paths default to stricter classification — a borderline finding in these domains is VALID, not DEFERRED.
+   - **Output:** Present the deduplicated severity table to the user before acting on fixes. Format: `| # | File | Finding | Source Agent(s) | Classification |`
+4. If fixable issues found: fix them directly, re-stage, and re-run only the relevant agents (not all four) to verify
+5. When all agents pass clean (or all findings are triaged): run `touch /tmp/.claude-gate2-approved` then retry the commit
+6. Only escalate to user if a finding is ambiguous, requires an architectural decision, or conflicts with existing patterns
+
+**Override path:** If the user explicitly says "skip review" or the commit is a trivial change (typo, formatting), run `touch /tmp/.claude-gate2-approved` without dispatching agents. The hook is a guardrail, not a cage.
+
+**Marker rules:** The approval marker is one-time-use (deleted after commit passes) and expires after 30 minutes.
 
 ### Gate 2.5: Agent Memory Write-Back (after every Gate 2)
 
-After evaluating Gate 2 findings, update agent memory:
+After evaluating Gate 2 findings, update agent memory. This is MANDATORY — not optional, not "when I remember." Run through this checklist:
 
-1. **False positives?** — Append to `.claude/agent-memory/<agent>/calibration.md`
-2. **New patterns?** — Append to `.claude/agent-memory/<agent>/patterns.md`
-3. **Corrections?** — Append to the agent's `MEMORY.md` under "Recent Corrections"
-4. **Codex/Gemini catches?** — Log in `calibration.md` with `[codex-catch]` or `[gemini-catch]`
+1. **False positives?** — If any Gate 2 finding was wrong, append to `.claude/agent-memory/<agent>/calibration.md` with date, what was flagged, and why it's wrong.
+2. **New patterns?** — If Gate 2 caught a real issue that represents a recurring class (not a one-off), append to `.claude/agent-memory/<agent>/patterns.md` with pattern name, first-seen PR, and confidence.
+3. **Corrections?** — If I overrode or modified a Gate 2 suggestion, append the correction to the agent's `MEMORY.md` under "Recent Corrections" with date and context.
+4. **Codex/Gemini catches?** — After Gate 3, if Codex or Gemini caught something the code-reviewer missed, log it in `calibration.md` as a coverage gap with tag `[codex-catch]` or `[gemini-catch]`.
 5. **Re-index** — `node ~/claude-memory/engine/memory-engine.mjs index --scope agents`
+
+If Gate 2 was clean (no findings, no false positives), write "No memory updates" in the session log and skip.
+
+**The test**: After every PR, the agent memory files should have grown or been refined. If they haven't, that's a process failure — same as failing Gate 1.
 
 ### Gate 3: Cross-Model Review — Codex + Gemini (after every batch or feature)
 
@@ -579,21 +624,26 @@ Invoke both Codex (OpenAI) and Gemini (Google). Command templates: read `~/.clau
 **Triage protocol (MANDATORY):**
 
 1. Read `/tmp/codex-review.md` and `/tmp/gemini-review.md`
-2. Verify each finding against actual code
+2. Verify each finding against actual code — both can misread
 3. Classify: VALID / PARTIALLY VALID / FALSE POSITIVE
 4. Tag: `[codex]`, `[gemini]`, or `[both]`
 5. Present to user with implement/defer recommendation
 6. User decides — Opus does not auto-implement Gate 3 findings
+7. Log catches Gate 2 missed in `calibration.md` with `[codex-catch]` or `[gemini-catch]`
 
 ### When to Run Each Gate
 
-| Scenario | Gate 1 | Gate 2 | Gate 3 |
-|----------|--------|--------|--------|
-| Subagent writes code | Yes | Yes | Yes |
-| Overnight batch completes | Yes | Yes | Yes |
-| Opus writes code interactively | Yes | Yes (if >3 files) | Yes (if security-sensitive) |
+| Scenario | Gate 1 | Gate 2 | Gate 3 (Codex + Gemini) |
+|----------|--------|--------|------------------------|
+| Subagent (Sonnet) writes code | Yes | Yes | Yes (both) |
+| Overnight batch completes | Yes | Yes | Yes (both) |
+| Opus writes code interactively | Yes | Yes (if >3 files) | Yes (both, if security-sensitive) |
 | Single-file lint/type fix | Yes | No | No |
 | Build-error-resolver runs | Yes | Yes | No |
+
+### AI Code Hygiene Reference
+
+The authoritative catalog of AI coding mistake patterns is `99_AI_CODE_HYGIENE_STANDARDS.md` (175 patterns across 6 categories: Quantitative Health, Spec Conformance, Security Hardening, Code Simplification, Integration Integrity, Adversarial Resilience). The companion execution plan is `99_AI_CODE_HYGIENE_FINISHING_PLAN.md`. Gate 2 agents encode the highest-impact patterns from this catalog in their checklists above.
 
 ## Self-Improvement
 
@@ -809,7 +859,7 @@ exit 0
 
 ### 8d. pre-commit-gate.sh — Auto Gate 2 Enforcement
 
-Blocks `git commit` unless code-reviewer + security-reviewer agents have approved.
+Blocks `git commit` unless the 4-agent review pipeline (Architect, Adversarial, Standards, Security) has approved.
 
 ```bash
 #!/bin/bash
@@ -844,7 +894,7 @@ if [ -f "$MARKER" ]; then
 fi
 
 cat <<'EOF'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"GATE 2 REQUIRED: Before committing, dispatch code-reviewer and security-reviewer agents on staged changes (git diff --cached). After both pass (or user overrides), run: touch /tmp/.claude-gate2-approved — then retry the commit."}}
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"GATE 2 REQUIRED: Before committing, dispatch all four review agents (Architect, Adversarial, Standards, Security) on staged changes (git diff --cached). After all pass (or user overrides), run: touch /tmp/.claude-gate2-approved — then retry the commit."}}
 EOF
 exit 0
 ```
