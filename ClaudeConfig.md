@@ -1,7 +1,7 @@
 # Claude Code Full Setup Configuration
 
 > Comprehensive setup document for replicating this Claude Code environment on a fresh machine.
-> Generated 2026-02-14. Updated 2026-03-01 (Beads + Timbers integration for persistent task tracking and development ledger).
+> Generated 2026-02-14. Updated 2026-03-02 (Timbers → Memory Engine bridge for reflexive retrieval of change reasoning).
 > No secrets, keys, or PII included — placeholders marked with `<REDACTED>`.
 
 ---
@@ -1018,7 +1018,7 @@ exit 0
 
 ### 8g. memory-retrieval.sh — Reflexive Memory Retrieval
 
-PostToolUse hook on `Read`. Automatically queries the FTS5 memory index whenever Claude reads a source file, injecting relevant memories as a `systemMessage`. Turns the memory system from passive (must search manually) to active (surfaces knowledge at the point of action).
+PostToolUse hook on `Read`. Automatically queries the FTS5 memory index whenever Claude reads a source file, injecting relevant memories as a `systemMessage`. Turns the memory system from passive (must search manually) to active (surfaces knowledge at the point of action). With the timbers-sync bridge (Section 13f/16g), this now also surfaces timbers ledger entries — so change reasoning auto-appears when reading related files.
 
 **Design:**
 - **Query method**: `sqlite3` CLI directly (~85ms vs ~1500ms Node.js engine startup)
@@ -1896,6 +1896,30 @@ Post-agent memory consolidation script (for SubagentStop hooks in project settin
 node ~/claude-memory/engine/memory-engine.mjs index --scope agents 2>/dev/null || true
 ```
 
+### 13f. timbers-sync.sh — Timbers → Memory Engine Bridge
+
+Exports timbers ledger entries to `~/claude-memory/projects/<project>/timbers-ledger.md` and indexes them into the memory engine's FTS5 search index. This enables the reflexive memory retrieval hook (Section 8) to auto-surface change reasoning when reading related files.
+
+**How it works:**
+1. Detects git repo and `.timbers/` directory (gracefully skips if absent)
+2. Resolves project name from `~/claude-memory/config.json` (or falls back to directory basename)
+3. Exports last 200 timbers entries as JSON via `timbers export --last 200 --json`
+4. Converts to H2-headings-per-entry markdown (what/why/how/commit/files/tags)
+5. Writes to `~/claude-memory/projects/<project>/timbers-ledger.md`
+6. Re-indexes the project scope in the memory engine
+
+**Automatic triggers:**
+- PreCompact hook (`pre-compact-flush.sh`) — syncs before context compaction
+- Session end (Pre-Compaction Flush step 7 in `~/CLAUDE.md`)
+
+**Manual invocation:**
+```bash
+~/claude-tools/timbers-sync.sh                    # Uses pwd
+~/claude-tools/timbers-sync.sh /path/to/repo     # Explicit repo path
+```
+
+**Effect:** When you `Read` a file like `src/middleware/auth.ts`, the reflexive retrieval hook queries the FTS5 index for "auth middleware" keywords. If a timbers entry exists documenting why auth middleware was changed, it surfaces automatically as a system message — no explicit search required.
+
 ---
 
 ## 14. QMD Local Search Engine
@@ -2057,6 +2081,27 @@ Add to `~/.claude/settings.local.json` permissions allow list:
 "Bash(timbers *)"
 ```
 
+### 16g. Timbers → Memory Engine Bridge
+
+Timbers entries are automatically synced into the memory engine so the reflexive retrieval hook (Section 8) surfaces change reasoning when reading related files.
+
+**Architecture:**
+
+```
+timbers log → .timbers/ JSON → timbers-sync.sh → timbers-ledger.md → memory engine FTS5 index
+                                                                              ↓
+                              Read tool → memory-retrieval.sh hook → FTS5 query → system message
+```
+
+**What gets surfaced:** When you read `src/lib/auth.ts`, the reflexive hook extracts keywords (`auth`) and queries FTS5. If a timbers entry documented why auth was changed, the entry's what/why/how appears as context — automatically, with zero manual search.
+
+**Sync triggers:**
+- **Automatic**: PreCompact hook fires `timbers-sync.sh` before context compaction
+- **Automatic**: Pre-Compaction Flush (step 7 in `~/CLAUDE.md`) during session wind-down
+- **Manual**: `~/claude-tools/timbers-sync.sh [repo-path]`
+
+**Output location:** `~/claude-memory/projects/<project>/timbers-ledger.md`
+
 ---
 
 ## 17. Verification Checklist
@@ -2117,9 +2162,9 @@ timbers --version
 │  PreToolUse │ PostToolUse │    Stop     │  PreCompact   │
 │   Hooks     │   Hooks     │   Hooks    │    Hooks      │
 ├─────────────┼─────────────┼────────────┼───────────────┤
-│ block-      │ prettier    │ guard-code │ memory-       │
-│ destructive │ observe-    │ code-review│ engine index  │
-│ block-      │ learning    │ diff-stat  │               │
+│ block-      │ prettier    │ guard-code │ timbers-sync  │
+│ destructive │ observe-    │ code-review│ memory-       │
+│ block-      │ learning    │ diff-stat  │ engine index  │
 │ patterns    │ run-tests   │ notify     │               │
 │ pre-commit  │             │            │               │
 │ gate        │             │            │               │
@@ -2151,7 +2196,8 @@ timbers --version
 │  Beads (bd)             │  Timbers                        │
 │  persistent tasks       │  development ledger             │
 │  dependency graph       │  what/why/how per change        │
-│  .beads/ (SQLite/Dolt)  │  .timbers/ (JSON)              │
+│  .beads/ (SQLite/Dolt)  │  .timbers/ → timbers-ledger.md │
+│                         │  (synced to Memory via bridge)  │
 ├─────────────────────────┴────────────────────────────────┤
 │                    MCP Servers                            │
 ├──────────────┬──────────────┬────────────────────────────┤
