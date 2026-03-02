@@ -1,7 +1,7 @@
 # Claude Code Full Setup Configuration
 
 > Comprehensive setup document for replicating this Claude Code environment on a fresh machine.
-> Generated 2026-02-14. Updated 2026-03-01 (post-99_ protocol review: 4-agent Gate 2 pipeline, AI hygiene anti-pattern checklist, expanded Sonnet delegation).
+> Generated 2026-02-14. Updated 2026-03-01 (Beads + Timbers integration for persistent task tracking and development ledger).
 > No secrets, keys, or PII included — placeholders marked with `<REDACTED>`.
 
 ---
@@ -23,7 +23,8 @@
 13. [Custom Tools — ~/claude-tools/](#13-custom-tools--claude-tools)
 14. [QMD Local Search Engine](#14-qmd-local-search-engine)
 15. [Auto Memory — Project Memory](#15-auto-memory--project-memory)
-16. [Verification Checklist](#16-verification-checklist)
+16. [Beads + Timbers — Task Tracking & Development Ledger](#16-beads--timbers--task-tracking--development-ledger)
+17. [Verification Checklist](#17-verification-checklist)
 
 ---
 
@@ -69,6 +70,16 @@ npm install -g @anthropic-ai/gemini  # or install per Google's docs
 
 # QMD (local markdown search engine via MCP)
 bun install -g qmd
+
+# Beads (persistent task tracking for AI agents)
+brew install beads
+
+# Timbers (development ledger — captures why behind changes)
+# Option A: Install script
+curl -fsSL https://raw.githubusercontent.com/gorewood/timbers/main/install.sh | bash
+# Option B: Download binary from GitHub releases
+# gh release download --repo gorewood/timbers --pattern "timbers_darwin_arm64.tar.gz" --dir /tmp
+# tar xzf /tmp/timbers_darwin_arm64.tar.gz -C /opt/homebrew/bin/
 
 # Happy Coder (optional — commit co-authorship)
 npm install -g happy-coder
@@ -234,6 +245,8 @@ File: `~/.claude/settings.local.json`
       "Bash(ls:*)",
       "Bash(wc:*)",
       "Bash(crontab:*)",
+      "Bash(bd *)",
+      "Bash(timbers *)",
       "Bash(test:*)",
       "WebSearch",
       "mcp__plugin_context7_context7__resolve-library-id",
@@ -1930,7 +1943,123 @@ Keep it under 200 lines (content after line 200 is truncated from the system pro
 
 ---
 
-## 16. Verification Checklist
+## 16. Beads + Timbers — Task Tracking & Development Ledger
+
+Two complementary tools for persistent project state that survives across sessions.
+
+| Tool | Answers | Storage |
+|------|---------|---------|
+| **Beads** (`bd`) | What needs doing? What's blocked? | `.beads/` (SQLite/Dolt) |
+| **Timbers** | Why was this done? What were the trade-offs? | `.timbers/` (JSON) |
+| **Memory System** | What do we know? What patterns work? | `~/claude-memory/` (unchanged) |
+
+### 16a. Installation
+
+```bash
+# Beads — persistent task tracker
+brew install beads
+bd --help
+
+# Timbers — development ledger
+# Option A: Install script
+curl -fsSL https://raw.githubusercontent.com/gorewood/timbers/main/install.sh | bash
+# Option B: GitHub release binary (arm64 macOS)
+gh release download --repo gorewood/timbers --pattern "timbers_darwin_arm64.tar.gz" --dir /tmp
+tar xzf /tmp/timbers_darwin_arm64.tar.gz -C /opt/homebrew/bin/
+
+timbers --version
+```
+
+### 16b. Per-Project Initialization
+
+```bash
+cd /path/to/project
+bd init --quiet        # Creates .beads/ directory
+timbers init           # Creates .timbers/ directory
+```
+
+Add `.beads/` and `.timbers/` to `.gitignore` or track them — both work. Tracking them allows task/ledger state to persist across clones and branches.
+
+### 16c. Beads — Persistent Task Tracking
+
+Replaces ephemeral `TaskCreate`/`TaskList` in git repos. Tasks persist across sessions, `/clear`, and compaction.
+
+**When to use Beads vs TaskCreate:**
+- **In a git repo with `.beads/`**: use `bd` for all task tracking
+- **Not in a git repo** (home dir, ad-hoc sessions): use `TaskCreate` for ephemeral tasks
+
+**Core commands:**
+
+```bash
+bd create "Task title" -p 1 -t task      # Create (priority 0-3)
+bd ready                                   # Unblocked tasks
+bd ready --json                            # Machine-readable
+bd update <id> --claim                     # Claim task
+bd close <id> --reason "Done"             # Complete task
+bd dep add <child> <parent>               # Add dependency
+bd list                                    # All tasks
+bd show <id>                               # Full detail
+bd doctor                                  # Orphaned work detection
+bd dep tree <id>                           # Dependency visualization
+bd dep cycles                              # Circular dependency check
+```
+
+**Workflow integration:**
+- **Session start**: `bd ready --json` (only if `.beads/` exists)
+- **During work**: `bd update <id> --claim` → work → `bd close <id>`
+- **Before commits**: `bd doctor` to catch orphaned issues
+- **Session end**: `bd list` snapshot into session log
+- **Multi-agent**: Hash-based IDs (`bd-a1b2`) prevent collisions
+
+### 16d. Timbers — Development Ledger
+
+Captures per-change reasoning as structured JSON. Complements `DECISIONS.md` (architectural) with granular change-level documentation.
+
+**Core commands:**
+
+```bash
+timbers log "what changed" --why "reasoning" --how "approach"
+timbers log "what" --why "why" --how "how" --notes "alternatives considered"
+timbers pending                                    # Undocumented commits
+timbers query --last 10                           # Recent entries
+timbers prime                                      # Session context injection
+timbers draft changelog --since 7d                # Generate changelog
+timbers draft decision-log --last 20              # Extract decisions
+timbers draft pr-description --range main..HEAD   # PR summary
+timbers draft standup --since 1d                  # Daily standup
+timbers draft --list                              # All available templates
+```
+
+**Workflow integration:**
+- **Session start**: `timbers prime` (only if `.timbers/` exists)
+- **After meaningful changes**: `timbers log` with what/why/how
+- **Before commits**: `timbers pending` to catch undocumented work
+- **PR creation**: `timbers draft pr-description` for summary
+- **Use `--notes`** only when real alternatives were considered (deliberation)
+
+### 16e. Session Protocol Updates
+
+The Session Start Protocol in `~/CLAUDE.md` includes:
+
+```
+5. If in a git repo with `.beads/`: run `bd ready --json` to load persistent tasks
+6. If in a git repo with `.timbers/`: run `timbers prime` for ledger context
+```
+
+These only fire in repos with initialized `.beads/`/`.timbers/` directories — zero overhead for non-project sessions.
+
+### 16f. Permissions
+
+Add to `~/.claude/settings.local.json` permissions allow list:
+
+```json
+"Bash(bd *)",
+"Bash(timbers *)"
+```
+
+---
+
+## 17. Verification Checklist
 
 After setting up, verify everything works:
 
@@ -1966,6 +2095,14 @@ gemini --version
 
 # 10. Notifications work
 terminal-notifier -message "Test notification" -title "Claude Code"
+
+# 11. Beads works
+bd --help
+# In a git repo: bd init --quiet && bd create "Test task" -p 1 && bd ready
+
+# 12. Timbers works
+timbers --version
+# In a git repo: timbers init && timbers log "test" --why "verify" --how "cli"
 ```
 
 ---
@@ -2009,6 +2146,13 @@ terminal-notifier -message "Test notification" -title "Claude Code"
 │          │          │ DECISIONS│  patterns.md             │
 │          │          │ sessions/│  solutions.md            │
 ├──────────┴──────────┴──────────┴────────────────────────┤
+│               Task Tracking & Development Ledger          │
+├─────────────────────────┬────────────────────────────────┤
+│  Beads (bd)             │  Timbers                        │
+│  persistent tasks       │  development ledger             │
+│  dependency graph       │  what/why/how per change        │
+│  .beads/ (SQLite/Dolt)  │  .timbers/ (JSON)              │
+├─────────────────────────┴────────────────────────────────┤
 │                    MCP Servers                            │
 ├──────────────┬──────────────┬────────────────────────────┤
 │  Context7    │  Playwright  │  QMD (local docs search)   │
